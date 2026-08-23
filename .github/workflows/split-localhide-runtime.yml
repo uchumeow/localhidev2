@@ -1,0 +1,120 @@
+name: Split LocalHide runtime
+
+on:
+  push:
+    paths:
+      - '.github/workflows/split-localhide-runtime.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  split:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Split runtime and write tiny loader
+        shell: python
+        run: |
+          from pathlib import Path
+          import hashlib, json, shutil
+
+          base = Path('builds/localhide')
+          index_path = base / 'index.js'
+          manifest_path = base / 'manifest.json'
+          source = index_path.read_text()
+
+          runtime_dir = base / 'runtime'
+          if runtime_dir.exists():
+              shutil.rmtree(runtime_dir)
+          runtime_dir.mkdir(parents=True)
+
+          chunk_size = 7000
+          chunks = [source[i:i+chunk_size] for i in range(0, len(source), chunk_size)]
+          names = []
+          for i, chunk in enumerate(chunks):
+              name = f'part-{i:02d}.js'
+              (runtime_dir / name).write_text(chunk)
+              names.append('runtime/' + name)
+
+          # Make sure the split runtime is byte-for-byte identical when reassembled.
+          rebuilt = ''.join((base / name).read_text() for name in names)
+          if rebuilt != source:
+              raise SystemExit('Runtime split verification failed')
+
+          parts_json = json.dumps(names)
+          loader = f'''(function () {{
+            "use strict";
+            var parts = {parts_json};
+            var inner = null;
+            var loading = null;
+
+            function toast(message) {{
+              try {{ vendetta.ui.toasts.showToast(message); }}
+              catch (e) {{ try {{ console.log(message); }} catch (_) {{}} }}
+            }}
+
+            async function loadInner() {{
+              if (inner) return inner;
+              if (loading) return loading;
+              loading = (async function () {{
+                var baseUrl = vendetta.plugin.id;
+                if (!baseUrl.endsWith("/")) baseUrl += "/";
+                var texts = await Promise.all(parts.map(async function (part) {{
+                  var response = await vendetta.utils.safeFetch(baseUrl + part, {{ cache: "no-store" }}, 20000);
+                  return await response.text();
+                }}));
+                var source = texts.join("");
+                var raw = (0, eval)("vendetta=>{{return " + source + "}}\\n//# sourceURL=" + baseUrl + "runtime.js")(vendetta);
+                inner = typeof raw === "function" ? raw() : raw;
+                inner = inner && inner.default ? inner.default : (inner || {{}});
+                return inner;
+              }})();
+              try {{ return await loading; }}
+              finally {{ loading = null; }}
+            }}
+
+            return {{
+              onLoad: function () {{
+                void loadInner()
+                  .then(function (plugin) {{ if (plugin && plugin.onLoad) return plugin.onLoad(); }})
+                  .catch(function (error) {{
+                    try {{ console.error("[LocalHide] runtime load failed", error); }} catch (_) {{}}
+                    toast("LocalHide runtime failed to load");
+                  }});
+              }},
+              onUnload: function () {{
+                if (inner && inner.onUnload) return inner.onUnload();
+              }},
+              settings: function LocalHideLoaderSettings() {{
+                var React = vendetta.metro.common.React;
+                var RN = vendetta.metro.common.ReactNative;
+                if (inner && inner.settings) return React.createElement(inner.settings);
+                return React.createElement(
+                  RN.View,
+                  {{ style: {{ padding: 16 }} }},
+                  React.createElement(RN.Text, null, "LocalHide is loading…")
+                );
+              }}
+            }};
+          }})()'''
+
+          index_path.write_text(loader)
+          manifest = json.loads(manifest_path.read_text())
+          manifest['hash'] = hashlib.sha256(loader.encode()).hexdigest()
+          manifest_path.write_text(json.dumps(manifest, indent=2) + '\n')
+
+          print('loader bytes:', len(loader.encode()))
+          print('runtime chunks:', len(names))
+          print('loader sha256:', manifest['hash'])
+
+      - name: Commit split-loader build
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add builds/localhide/index.js builds/localhide/manifest.json builds/localhide/runtime
+          git commit -m 'Use chunked LocalHide runtime loader'
+          git push
