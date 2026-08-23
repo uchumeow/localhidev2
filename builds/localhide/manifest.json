@@ -1,0 +1,20 @@
+{
+  "id": "localhide",
+  "spec": 3,
+  "version": "0.1.0",
+  "type": "plugin",
+  "display": {
+    "name": "LocalHide",
+    "description": "Locally hide and protect messages in Discord DMs.",
+    "authors": [
+      {
+        "name": "uchumeow"
+      }
+    ]
+  },
+  "main": "index.js",
+  "extras": {
+    "icon": "HideIcon",
+    "hash": "553aa8c7b651181e09fc780012963c38263f06784d974d4e69257a0fa272d544"
+  }
+}
