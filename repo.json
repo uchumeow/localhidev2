@@ -1,0 +1,9 @@
+{
+  "$meta": {
+    "name": "LocalHide",
+    "description": "LocalHide Kettu plugin repository"
+  },
+  "localhide": {
+    "version": "0.1.0"
+  }
+}
