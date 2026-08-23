@@ -9,22 +9,58 @@
     catch (e) { try { console.log(message); } catch (_) {} }
   }
 
+  function errText(error) {
+    try {
+      if (error && error.message) return String(error.message);
+      return String(error);
+    } catch (_) {
+      return "unknown error";
+    }
+  }
+
+  async function fetchPart(baseUrl, part) {
+    var lastError = null;
+    for (var attempt = 1; attempt <= 3; attempt++) {
+      try {
+        var response = await vendetta.utils.safeFetch(baseUrl + part, { cache: "no-store" }, 30000);
+        return await response.text();
+      } catch (error) {
+        lastError = error;
+        try { console.warn("[LocalHide] " + part + " attempt " + attempt + " failed", error); } catch (_) {}
+      }
+    }
+    throw new Error(part + ": " + errText(lastError));
+  }
+
   async function loadInner() {
     if (inner) return inner;
     if (loading) return loading;
     loading = (async function () {
       var baseUrl = vendetta.plugin.id;
       if (!baseUrl.endsWith("/")) baseUrl += "/";
-      var texts = await Promise.all(parts.map(async function (part) {
-        var response = await vendetta.utils.safeFetch(baseUrl + part, { cache: "no-store" }, 20000);
-        return await response.text();
-      }));
+
+      var texts = [];
+      for (var i = 0; i < parts.length; i++) {
+        texts.push(await fetchPart(baseUrl, parts[i]));
+      }
+
       var source = texts.join("");
-      var raw = (0, eval)("vendetta=>{return " + source + "}\n//# sourceURL=" + baseUrl + "runtime.js")(vendetta);
-      inner = typeof raw === "function" ? raw() : raw;
-      inner = inner && inner.default ? inner.default : (inner || {});
+      var raw;
+      try {
+        raw = (0, eval)("vendetta=>{return " + source + "}\n//# sourceURL=" + baseUrl + "runtime.js")(vendetta);
+      } catch (error) {
+        throw new Error("eval: " + errText(error));
+      }
+
+      try {
+        inner = typeof raw === "function" ? raw() : raw;
+        inner = inner && inner.default ? inner.default : (inner || {});
+      } catch (error) {
+        throw new Error("init: " + errText(error));
+      }
       return inner;
     })();
+
     try { return await loading; }
     finally { loading = null; }
   }
@@ -32,10 +68,25 @@
   return {
     onLoad: function () {
       void loadInner()
-        .then(function (plugin) { if (plugin && plugin.onLoad) return plugin.onLoad(); })
+        .then(function (plugin) {
+          if (plugin && plugin.onLoad) {
+            try {
+              var result = plugin.onLoad();
+              if (result && typeof result.catch === "function") {
+                return result.catch(function (error) {
+                  throw new Error("startup: " + errText(error));
+                });
+              }
+              return result;
+            } catch (error) {
+              throw new Error("startup: " + errText(error));
+            }
+          }
+        })
         .catch(function (error) {
-          try { console.error("[LocalHide] runtime load failed", error); } catch (_) {}
-          toast("LocalHide runtime failed to load");
+          var detail = errText(error);
+          try { console.error("[LocalHide] runtime load failed: " + detail, error); } catch (_) {}
+          toast("LocalHide error: " + detail);
         });
     },
     onUnload: function () {
