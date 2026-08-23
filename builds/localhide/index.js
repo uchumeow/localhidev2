@@ -1,3 +1,35 @@
+(function () {
+  "use strict";
+var __lhActionSheet = vendetta.metro.findByProps("openLazy", "hideActionSheet");
+var bunny = {
+  metro: vendetta.metro,
+  api: { patcher: vendetta.patcher },
+  ui: {
+    toasts: vendetta.ui.toasts,
+    alerts: vendetta.ui.alerts,
+    assets: vendetta.ui.assets,
+    navigation: vendetta.metro.common.navigation,
+    sheets: {
+      showSheet: function (key, component, props) {
+        if (!__lhActionSheet || typeof __lhActionSheet.openLazy !== "function") return;
+        var lazy = component && typeof component.then === "function"
+          ? component
+          : Promise.resolve({ default: component });
+        return __lhActionSheet.openLazy(lazy, key, props || {});
+      },
+      hideSheet: function (key) {
+        return __lhActionSheet && __lhActionSheet.hideActionSheet
+          ? __lhActionSheet.hideActionSheet(key)
+          : undefined;
+      }
+    }
+  },
+  plugin: {
+    createStorage: function () { return vendetta.plugin.storage; },
+    logger: vendetta.logger || console
+  }
+};
+var definePlugin = function (plugin) { return plugin; };
 "use strict";
 var LocalHide;
 (function (LocalHide) {
@@ -1211,4 +1243,9 @@ var LocalHide;
     };
 })(LocalHide || (LocalHide = {}));
 
-var plugin = { default: definePlugin(LocalHide.plugin) };
+return {
+  onLoad: function () { return LocalHide.plugin.start(); },
+  onUnload: function () { return LocalHide.plugin.stop(); },
+  settings: LocalHide.SettingsComponent
+};
+})()
