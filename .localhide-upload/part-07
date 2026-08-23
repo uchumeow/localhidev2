@@ -1,0 +1,140 @@
+            if (args[0] && typeof args[0] === "object")
+                args[0] = filteredProps(args[0]);
+        });
+        LocalHide.diag(`Message filter attached to ${label}.${method}`);
+        return true;
+    }
+    function installMessageFilterPatch() {
+        let installed = false;
+        const candidates = [
+            [LocalHide.findByName("ChatView"), "default", "ChatView"],
+            [LocalHide.findByName("MessageList"), "default", "MessageList"],
+            [LocalHide.findByName("MessageListView"), "default", "MessageListView"],
+            [LocalHide.findByName("RowGenerator"), "default", "RowGenerator"]
+        ];
+        for (const [mod, method, label] of candidates) {
+            try {
+                installed = patchComponent(mod, method, label) || installed;
+            }
+            catch (e) {
+                LocalHide.diag(`Filter patch ${label} failed: ${e.message}`);
+            }
+        }
+        if (!installed) {
+            const rowModule = LocalHide.findByProps("generateRows", "getRows") ?? LocalHide.findByProps("getRows");
+            for (const method of ["generateRows", "getRows"]) {
+                if (!rowModule || typeof rowModule[method] !== "function")
+                    continue;
+                bunny.api.patcher.after(method, rowModule, (args, ret) => {
+                    if (!Array.isArray(ret) || !LocalHide.isEnabledSync())
+                        return ret;
+                    const channelId = String(args?.[0]?.channelId ?? args?.[0]?.channel?.id ?? "");
+                    const identity = channelId ? LocalHide.dmIdentityFromChannel(channelId) : undefined;
+                    return identity ? filterArrayForDm(ret, identity) : ret;
+                });
+                installed = true;
+                LocalHide.diag(`Message filter attached to row generator ${method}`);
+                break;
+            }
+        }
+        LocalHide.compatibility.messageFilter = installed;
+        if (!installed)
+            LocalHide.diag("No compatible rendered-message list interception point found on this build");
+        return installed;
+    }
+    LocalHide.installMessageFilterPatch = installMessageFilterPatch;
+})(LocalHide || (LocalHide = {}));
+var LocalHide;
+(function (LocalHide) {
+    function loadedMessages(channelId) {
+        const store = LocalHide.findByStoreName("MessageStore") ?? LocalHide.findByProps("getMessages", "getMessage");
+        try {
+            const collection = store?.getMessages?.(channelId);
+            if (Array.isArray(collection))
+                return collection;
+            if (typeof collection?.toArray === "function")
+                return collection.toArray();
+            if (Array.isArray(collection?._array))
+                return collection._array;
+            if (Array.isArray(collection?._messages))
+                return collection._messages;
+            if (collection && typeof collection === "object")
+                return Object.values(collection).filter((v) => v?.id);
+        }
+        catch (e) {
+            LocalHide.diag(`Could not read loaded messages: ${e.message}`);
+        }
+        return [];
+    }
+    function LocalHideActionBlock(props) {
+        const R = LocalHide.react();
+        const RN = LocalHide.rn();
+        if (!R || !RN || !props?.message || !LocalHide.isEnabledSync())
+            return null;
+        const channelId = String(props.channelId ?? props.message.channel_id ?? props.message.channelId ?? "");
+        const identity = channelId ? LocalHide.dmIdentityFromChannel(channelId) : undefined;
+        if (!identity)
+            return null;
+        const base = { paddingVertical: 13, paddingHorizontal: 16, borderTopWidth: 1, borderTopColor: "#3F4147" };
+        const text = { color: "white", fontSize: 16, fontWeight: "600" };
+        const hideOne = async () => {
+            try {
+                bunny.ui.sheets.hideSheet?.(props.sheetKey ?? "MessageLongPressActionSheet");
+            }
+            catch { }
+            await LocalHide.hideWithPasswordFlow(identity, [LocalHide.snapshotMessage(props.message, identity)]);
+        };
+        const selectMany = () => {
+            try {
+                bunny.ui.sheets.hideSheet?.(props.sheetKey ?? "MessageLongPressActionSheet");
+            }
+            catch { }
+            const hidden = LocalHide.getHiddenSet(LocalHide.conversationKey(identity.channelId, identity.otherUserId));
+            const messages = loadedMessages(channelId).filter(message => !hidden.has(String(message?.id ?? "")));
+            bunny.ui.sheets.showSheet?.("LocalHideBulkSelect", LocalHide.BulkSelectSheet, { identity, messages });
+        };
+        return R.createElement(RN.View, null, R.createElement(RN.Pressable, { style: base, onPress: hideOne }, R.createElement(RN.Text, { style: text }, "Hide Locally")), R.createElement(RN.Pressable, { style: base, onPress: selectMany }, R.createElement(RN.Text, { style: text }, "Select Messages")));
+    }
+    LocalHide.LocalHideActionBlock = LocalHideActionBlock;
+    function appendActionBlock(element, messageProps, sheetKey) {
+        const R = LocalHide.react();
+        if (!R?.isValidElement?.(element))
+            return element;
+        const block = R.createElement(LocalHideActionBlock, { message: messageProps.message, channelId: messageProps.channelId, sheetKey });
+        const existing = element.props?.children;
+        const children = Array.isArray(existing) ? [...existing, block] : [existing, block].filter(Boolean);
+        return R.cloneElement(element, { ...element.props }, ...children);
+    }
+    function installMessageActionsPatch() {
+        const actionSheet = LocalHide.findByProps("openLazy", "hideActionSheet");
+        if (!actionSheet?.openLazy) {
+            LocalHide.compatibility.messageActions = false;
+            LocalHide.diag("Message action-sheet openLazy module not found");
+            return false;
+        }
+        bunny.api.patcher.before("openLazy", actionSheet, (args) => {
+            const key = String(args[1] ?? "");
+            const props = args[2];
+            if (!LocalHide.isEnabledSync() || !props?.message || !/Message.*(LongPress|ActionSheet)|MessageLongPressActionSheet/i.test(key))
+                return;
+            const channelId = String(props.channelId ?? props.message.channel_id ?? props.message.channelId ?? "");
+            if (!LocalHide.dmIdentityFromChannel(channelId))
+                return;
+            const lazy = args[0];
+            try {
+                args[0] = Promise.resolve(lazy).then((mod) => {
+                    const Original = mod?.default ?? mod;
+                    if (typeof Original !== "function")
+                        return mod;
+                    const Wrapped = (componentProps) => appendActionBlock(Original(componentProps), props, key);
+                    try {
+                        Object.defineProperty(Wrapped, "name", { value: "LocalHideMessageActionSheet" });
+                    }
+                    catch { }
+                    return { ...(mod && typeof mod === "object" ? mod : {}), default: Wrapped };
+                });
+            }
+            catch (e) {
+                LocalHide.diag(`Message action wrapping failed: ${e.message}`);
+            }
+        });
