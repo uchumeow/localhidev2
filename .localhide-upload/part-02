@@ -1,0 +1,140 @@
+        return "Unavailable";
+    }
+    LocalHide.cryptoBackendName = cryptoBackendName;
+    function hasSecureCrypto() {
+        return cryptoBackendName() !== "Unavailable";
+    }
+    LocalHide.hasSecureCrypto = hasSecureCrypto;
+    function randomBytes(length) {
+        const web = webCryptoApi();
+        if (web) {
+            const out = new Uint8Array(length);
+            web.getRandomValues(out);
+            return out;
+        }
+        const native = nativeCryptoApi();
+        if (native)
+            return new Uint8Array(Array.from(native.randomBytes(length)));
+        throw new Error("SECURE_CRYPTO_UNAVAILABLE");
+    }
+    LocalHide.randomBytes = randomBytes;
+    async function deriveArchiveKey(password, saltB64, iterations = LocalHide.KDF_ITERATIONS) {
+        const web = webCryptoApi();
+        if (web) {
+            const material = await web.subtle.importKey("raw", LocalHide.utf8Encode(password), "PBKDF2", false, ["deriveKey"]);
+            return web.subtle.deriveKey({ name: "PBKDF2", salt: LocalHide.base64ToBytes(saltB64), iterations, hash: "SHA-256" }, material, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+        }
+        const native = nativeCryptoApi();
+        if (native) {
+            const derived = native.pbkdf2Sync(LocalHide.utf8Encode(password), LocalHide.base64ToBytes(saltB64), iterations, 32, "sha256");
+            return new Uint8Array(Array.from(derived));
+        }
+        throw new Error("SECURE_CRYPTO_UNAVAILABLE");
+    }
+    LocalHide.deriveArchiveKey = deriveArchiveKey;
+    async function encryptBytes(key, plaintext) {
+        const iv = randomBytes(12);
+        if (!isNativeKey(key)) {
+            const web = webCryptoApi();
+            if (!web)
+                throw new Error("SECURE_CRYPTO_UNAVAILABLE");
+            const encrypted = await web.subtle.encrypt({ name: "AES-GCM", iv }, key, plaintext);
+            return { iv: LocalHide.bytesToBase64(iv), ciphertext: LocalHide.bytesToBase64(new Uint8Array(encrypted)) };
+        }
+        const native = nativeCryptoApi();
+        if (!native)
+            throw new Error("SECURE_CRYPTO_UNAVAILABLE");
+        const cipher = native.createCipheriv("aes-256-gcm", key, iv);
+        const encrypted = concatBytes([cipher.update(plaintext), cipher.final(), cipher.getAuthTag()]);
+        return { iv: LocalHide.bytesToBase64(iv), ciphertext: LocalHide.bytesToBase64(encrypted) };
+    }
+    LocalHide.encryptBytes = encryptBytes;
+    async function decryptBytes(key, blob) {
+        if (!isNativeKey(key)) {
+            const web = webCryptoApi();
+            if (!web)
+                throw new Error("SECURE_CRYPTO_UNAVAILABLE");
+            const decrypted = await web.subtle.decrypt({ name: "AES-GCM", iv: LocalHide.base64ToBytes(blob.iv) }, key, LocalHide.base64ToBytes(blob.ciphertext));
+            return new Uint8Array(decrypted);
+        }
+        const native = nativeCryptoApi();
+        if (!native)
+            throw new Error("SECURE_CRYPTO_UNAVAILABLE");
+        const combined = LocalHide.base64ToBytes(blob.ciphertext);
+        if (combined.length < 16)
+            throw new Error("ARCHIVE_CORRUPTED");
+        const ciphertext = combined.slice(0, -16);
+        const tag = combined.slice(-16);
+        const decipher = native.createDecipheriv("aes-256-gcm", key, LocalHide.base64ToBytes(blob.iv));
+        decipher.setAuthTag(tag);
+        return concatBytes([decipher.update(ciphertext), decipher.final()]);
+    }
+    LocalHide.decryptBytes = decryptBytes;
+    async function encryptJson(key, value) {
+        return encryptBytes(key, LocalHide.utf8Encode(JSON.stringify(value)));
+    }
+    LocalHide.encryptJson = encryptJson;
+    async function decryptJson(key, blob) {
+        const bytes = await decryptBytes(key, blob);
+        return JSON.parse(LocalHide.utf8Decode(bytes));
+    }
+    LocalHide.decryptJson = decryptJson;
+    async function makeVerifier(key) {
+        return encryptBytes(key, LocalHide.utf8Encode(VERIFIER_TEXT));
+    }
+    LocalHide.makeVerifier = makeVerifier;
+    async function verifyKey(key, blob) {
+        try {
+            return LocalHide.utf8Decode(await decryptBytes(key, blob)) === VERIFIER_TEXT;
+        }
+        catch {
+            return false;
+        }
+    }
+    LocalHide.verifyKey = verifyKey;
+})(LocalHide || (LocalHide = {}));
+var LocalHide;
+(function (LocalHide) {
+    function validatePassword(password) {
+        if (password.length < LocalHide.PASSWORD_MIN_LENGTH) {
+            throw new Error(`Password must be at least ${LocalHide.PASSWORD_MIN_LENGTH} characters`);
+        }
+    }
+    function validateMessages(messages) {
+        const seen = new Set();
+        const out = [];
+        for (const message of messages) {
+            if (!message || !message.messageId || !message.channelId || seen.has(message.messageId))
+                continue;
+            seen.add(message.messageId);
+            out.push(LocalHide.cloneSnapshot(message));
+        }
+        return LocalHide.stableSortMessages(out);
+    }
+    async function createArchive(identity, password, initialMessages) {
+        validatePassword(password);
+        if (!LocalHide.hasSecureCrypto())
+            throw new Error("SECURE_CRYPTO_UNAVAILABLE");
+        const keyName = LocalHide.conversationKey(identity.channelId, identity.otherUserId);
+        if (await LocalHide.getRecord(keyName))
+            throw new Error("ARCHIVE_ALREADY_EXISTS");
+        const salt = LocalHide.bytesToBase64(LocalHide.randomBytes(16));
+        const key = await LocalHide.deriveArchiveKey(password, salt);
+        const messages = validateMessages(initialMessages);
+        const verifier = await LocalHide.makeVerifier(key);
+        const archive = await LocalHide.encryptJson(key, messages);
+        const now = LocalHide.nowIso();
+        const record = {
+            schemaVersion: 1,
+            channelId: identity.channelId,
+            otherUserId: identity.otherUserId,
+            displayName: identity.displayName,
+            hiddenIds: LocalHide.uniqueStrings(messages.map(m => m.messageId)),
+            salt,
+            kdf: { name: "PBKDF2", hash: "SHA-256", iterations: LocalHide.KDF_ITERATIONS },
+            verifier,
+            archive,
+            createdAt: now,
+            updatedAt: now
+        };
+        await LocalHide.upsertRecord(keyName, record);
